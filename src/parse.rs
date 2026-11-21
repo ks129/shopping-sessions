@@ -434,11 +434,10 @@ fn digits(x: u64, m: u64) -> bool {
 /// Value of 8 ASCII digits (first byte most significant).
 #[inline(always)]
 fn parse8(x: u64) -> u64 {
-    let mut v = x - ZEROS;
-    v = (v * 10) + (v >> 8);
-    v = (((v & 0x0000_00FF_0000_00FF) * (100 + (1_000_000 << 32)))
-        + (((v >> 16) & 0x0000_00FF_0000_00FF) * (1 + (10_000 << 32))))
-        >> 32;
+    // wrapping: also called on bytes that may not be digits (result unused then)
+    let mut v = x.wrapping_sub(ZEROS);
+    v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    v = ((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32))).wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32))) >> 32;
     v
 }
 

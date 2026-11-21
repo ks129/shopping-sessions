@@ -368,6 +368,53 @@ fn resolve_all<T>(links: &Links, items: &[T], key: impl Fn(&T) -> (u64, u64), sl
     }
 }
 
+/// A small exact lookup table from byte strings to u32, keyed by the short
+/// hash (open addressing; the bytes are compared on a hash match).
+struct BTab {
+    keys: Vec<(u64, u32)>,
+    strs: Vec<&'static [u8]>,
+    mask: usize,
+}
+
+impl BTab {
+    /// A table for up to `cap` distinct keys.
+    fn new(cap: usize) -> Self {
+        let size = (cap * 4).next_power_of_two().max(16);
+        BTab { keys: vec![(0, u32::MAX); size], strs: Vec::new(), mask: size - 1 }
+    }
+    /// Adds `k` unless present; true if it was new (its index is the count
+    /// of distinct keys before it).
+    fn insert(&mut self, k: &'static [u8]) -> bool {
+        if self.get(k).is_some() {
+            return false;
+        }
+        let h = h128(k).0;
+        let mut s = h as usize & self.mask;
+        while self.keys[s].1 != u32::MAX {
+            s = (s + 1) & self.mask;
+        }
+        self.keys[s] = (h, self.strs.len() as u32);
+        self.strs.push(k);
+        true
+    }
+    /// Index (insertion order of distinct keys) of `k`, if present.
+    #[inline(always)]
+    fn get(&self, k: &[u8]) -> Option<u32> {
+        let h = h128(k).0;
+        let mut s = h as usize & self.mask;
+        loop {
+            let (kh, i) = unsafe { *self.keys.get_unchecked(s) };
+            if i == u32::MAX {
+                return None;
+            }
+            if kh == h && self.strs[i as usize] == k {
+                return Some(i);
+            }
+            s = (s + 1) & self.mask;
+        }
+    }
+}
+
 /// 128-bit hash of an ID. Up to 16 bytes: two independent folded 64x64-bit
 /// multiplies over two (overlapping) 8-byte loads and the length; longer: xxh3.
 #[inline(always)]
@@ -392,9 +439,7 @@ fn h128(b: &[u8]) -> (u64, u64) {
     }
     const K: [u64; 4] = [0xA076_1D64_78BD_642F, 0xE703_7ED1_A0B4_28DB, 0x8EBC_6AF0_9C88_C6E3, 0x5899_65CC_7537_4CC3];
     let l = n as u64;
-    let lo = fold(a ^ K[0], c ^ K[1] ^ l.rotate_left(32));
-    let hi = fold(a ^ K[2] ^ l, c ^ K[3]);
-    (fold(lo ^ K[1], hi ^ K[2]) ^ lo, hi.rotate_left(29) ^ fold(lo ^ K[3], hi ^ K[0]))
+    (fold(a ^ K[0], c ^ K[1] ^ l.rotate_left(32)), fold(a ^ K[2] ^ l, c ^ K[3]))
 }
 
 #[cold]
@@ -913,14 +958,18 @@ fn main() {
 
     let mut cat_names: Vec<&'static [u8]> = Vec::new();
     let mut cat_ids: hashbrown::HashMap<&'static [u8], u16> = hashbrown::HashMap::new();
-    let mut products: hashbrown::HashMap<&'static [u8], u16> = hashbrown::HashMap::new();
-    for_each_line::<2, _>(body(map_file(&data.join("products.csv"))), |f| {
+    let products_csv = body(map_file(&data.join("products.csv")));
+    let mut products = BTab::new(memchr::memchr_iter(b'\n', products_csv).count() + 1);
+    let mut prod_cat: Vec<u16> = Vec::new(); // by product index; the first line of a product wins
+    for_each_line::<2, _>(products_csv, |f| {
         let n = cat_names.len() as u16;
         let c = *cat_ids.entry(f[1]).or_insert(n);
         if c == n {
             cat_names.push(f[1]);
         }
-        products.entry(f[0]).or_insert(c);
+        if products.insert(f[0]) {
+            prod_cat.push(c);
+        }
     });
     let unknown = cat_names.len() as u16;
     cat_names.push(b"unknown");
@@ -935,10 +984,10 @@ fn main() {
 
     let mut camp_ids: Vec<&'static [u8]> = Vec::new();
     let mut channels: Vec<&'static [u8]> = Vec::new();
-    let mut camps: hashbrown::HashMap<&'static [u8], u32> = hashbrown::HashMap::new();
-    for_each_line::<2, _>(body(map_file(&data.join("campaigns.csv"))), |f| {
-        if !camps.contains_key(f[0]) {
-            camps.insert(f[0], camp_ids.len() as u32);
+    let campaigns_csv = body(map_file(&data.join("campaigns.csv")));
+    let mut camps = BTab::new(memchr::memchr_iter(b'\n', campaigns_csv).count() + 1);
+    for_each_line::<2, _>(campaigns_csv, |f| {
+        if camps.insert(f[0]) {
             camp_ids.push(f[0]);
             channels.push(f[1]);
         }
@@ -1010,7 +1059,7 @@ fn main() {
                         Some(ts) if ts >= base && ts < we => ts,
                         _ => return,
                     };
-                    let Some(&camp) = camps.get(f[2]) else { return };
+                    let Some(camp) = camps.get(f[2]) else { return };
                     let (lo, hi) = h128(f[1]);
                     cpend.push((S::new(f[1]), lo, hi, S::new(f[0]), (ts - base) as u32, camp));
                 });
@@ -1053,7 +1102,7 @@ fn main() {
                 if valid && purchase {
                     match parse_price(f[6]) {
                         Some(p) => {
-                            let cat = *products.get(f[5]).unwrap_or(&unknown) as u32;
+                            let cat = products.get(f[5]).map_or(unknown, |i| prod_cat[i as usize]) as u32;
                             pc = p | (cat & 0xFF) << 24;
                             cathi = cat >> 8;
                         }
