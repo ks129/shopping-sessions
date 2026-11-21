@@ -1,0 +1,7 @@
+target
+fixtures
+scripts
+*.md
+.git
+examples
+out
