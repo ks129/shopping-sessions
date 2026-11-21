@@ -10,85 +10,237 @@ pub const DAY: i64 = 24 * HOUR;
 /// A line is well formed when it has exactly `N` fields and every field is
 /// either quote-free or a whole field wrapped in one pair of quotes.
 ///
-/// Works on 64-byte blocks: SIMD compares give bit masks of separators
-/// (',' and '\n') and quotes; the loop visits separators only, and a field's
-/// quotes are checked with a mask over a two-block window.
+/// Two passes over segments of up to SEG 64-byte blocks. A SIMD pass writes
+/// comma and quote bit masks with running counts, and the positions of all
+/// commas and newlines. The line pass then walks the newlines: prefix counts
+/// give each line's first comma and its comma and quote counts in O(1), its
+/// fields come straight from the comma positions, and quotes are stripped
+/// without branches (valid iff the line's quote count is twice the number of
+/// fields that start and end with a quote).
 #[inline(always)]
 pub fn for_each_line<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], mut f: F) {
-    let mut fields: [&'a [u8]; N] = [&[]; N];
-    let mut nf = 0usize;
-    let mut fstart = 0usize;
-    let mut lstart = 0usize;
-    let mut bad = false;
-
+    const SEG: usize = 2048;
     let len = buf.len();
-    let mut blk = 0usize;
-    let mut qprev = 0u64;
-    while blk < len {
-        let (mut sep, nl, qcur) = if blk + 64 <= len {
-            unsafe { masks(buf.as_ptr().add(blk)) }
+    assert!(len < u32::MAX as usize - 128);
+    let nblocks = len.div_ceil(64);
+    let mut sc = SCRATCH.with(|c| c.take());
+    let mut ls = 0usize;
+    let mut seg = 0usize;
+    let mut base = 0usize;
+    while seg < nblocks {
+        let end = (seg + SEG).min(nblocks);
+        fill(buf, seg, end, &mut sc);
+        base = seg * 64;
+        for &le in sc.npos.iter() {
+            let le = le as usize;
+            if le < ls {
+                continue; // before the segment's first line start: done already
+            }
+            line::<N, F>(buf, &sc, base, ls, le, &mut f);
+            ls = le + 1;
+        }
+        if end == nblocks {
+            break;
+        }
+        let next = ls >> 6;
+        if next > seg {
+            seg = next;
+            continue;
+        }
+        // A line longer than a segment: handle it on its own.
+        match memchr::memchr(b'\n', &buf[end * 64..]) {
+            Some(k) => {
+                let le = end * 64 + k;
+                slow_line::<N, F>(&buf[ls..le], &mut f);
+                ls = le + 1;
+                seg = ls >> 6;
+            }
+            None => {
+                slow_line::<N, F>(&buf[ls..], &mut f);
+                ls = len;
+                break;
+            }
+        }
+    }
+    if ls < len {
+        // Last line without a newline (its blocks are in the last segment).
+        line::<N, F>(buf, &sc, base, ls, len, &mut f);
+    }
+    SCRATCH.with(|c| c.set(sc));
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Blk {
+    c: u64,
+    q: u64,
+    /// commas and quotes before this block, in the segment
+    cc: u32,
+    qc: u32,
+}
+
+#[derive(Default)]
+struct Scratch {
+    blks: Vec<Blk>,
+    cpos: Vec<u32>,
+    npos: Vec<u32>,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::Cell<Scratch> = const { std::cell::Cell::new(Scratch { blks: Vec::new(), cpos: Vec::new(), npos: Vec::new() }) };
+}
+
+/// Writes the positions of the set bits of `m` (plus `off`) at `out`;
+/// returns how many. Writes up to 8 (or the count, if more) unconditionally.
+#[inline(always)]
+unsafe fn flatten(out: *mut u32, mut m: u64, off: u32) -> usize {
+    let cnt = m.count_ones() as usize;
+    for k in 0..8 {
+        *out.add(k) = off + m.trailing_zeros();
+        m &= m.wrapping_sub(1);
+    }
+    if cnt > 8 {
+        for k in 8..cnt {
+            *out.add(k) = off + m.trailing_zeros();
+            m &= m - 1;
+        }
+    }
+    cnt
+}
+
+/// Masks, running counts and comma/newline positions of blocks [seg, end),
+/// plus one empty sentinel block.
+#[inline(never)]
+fn fill(buf: &[u8], seg: usize, end: usize, sc: &mut Scratch) {
+    let nb = end - seg;
+    sc.blks.clear();
+    sc.blks.reserve(nb + 1);
+    sc.cpos.clear();
+    sc.cpos.reserve(nb * 64 + 16);
+    sc.npos.clear();
+    sc.npos.reserve(nb * 64 + 16);
+    let (cp, np) = (sc.cpos.as_mut_ptr(), sc.npos.as_mut_ptr());
+    let (mut cc, mut nc, mut qc) = (0usize, 0usize, 0u32);
+    let len = buf.len();
+    for b in seg..end {
+        let off = b * 64;
+        let (c, n, q) = if off + 64 <= len {
+            unsafe { masks(buf.as_ptr().add(off)) }
         } else {
             let mut tail = [0u8; 64];
-            tail[..len - blk].copy_from_slice(&buf[blk..]);
+            tail[..len - off].copy_from_slice(&buf[off..]);
             unsafe { masks(tail.as_ptr()) }
         };
-        // Quote bits of [blk - 64, blk + 64).
-        let window = ((qcur as u128) << 64) | qprev as u128;
-        while sep != 0 {
-            let off = sep.trailing_zeros() as usize;
-            sep &= sep - 1;
-            let pos = blk + off;
-            if !bad && nf < N {
-                let flen = pos - fstart;
-                let q = if fstart + 64 >= blk {
-                    // fstart >= blk - 64: inside the window
-                    let shift = fstart + 64 - blk;
-                    let bits = (window >> shift) as u64;
-                    if flen >= 64 { u64::MAX } else { bits & ((1u64 << flen) - 1) }
-                } else {
-                    u64::MAX // field longer than the window: slow path below
-                };
-                if q == 0 {
-                    fields[nf] = unsafe { buf.get_unchecked(fstart..pos) };
-                } else if q != u64::MAX {
-                    if q.count_ones() == 2 && q & 1 == 1 && (q >> (flen - 1)) & 1 == 1 {
-                        fields[nf] = unsafe { buf.get_unchecked(fstart + 1..pos - 1) };
-                    } else {
-                        bad = true;
-                    }
-                } else {
-                    match unquote(&buf[fstart..pos]) {
-                        Some(v) => fields[nf] = v,
-                        None => bad = true,
-                    }
+        sc.blks.push(Blk { c, q, cc: cc as u32, qc });
+        unsafe {
+            cc += flatten(cp.add(cc), c, off as u32);
+            let mut m = n;
+            let k = n.count_ones() as usize;
+            *np.add(nc) = off as u32 + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            *np.add(nc + 1) = off as u32 + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            if k > 2 {
+                for j in 2..k {
+                    *np.add(nc + j) = off as u32 + m.trailing_zeros();
+                    m &= m - 1;
                 }
             }
-            nf += 1;
-            fstart = pos + 1;
-            if (nl >> off) & 1 == 1 {
-                if !bad && nf == N && pos > lstart {
-                    f(&fields);
-                }
-                nf = 0;
-                bad = false;
-                lstart = pos + 1;
-            }
+            nc += k;
         }
-        qprev = qcur;
-        blk += 64;
+        qc += q.count_ones();
     }
-    if lstart < len {
-        // Last line without a newline.
-        if !bad && nf < N {
-            match unquote(&buf[fstart..len]) {
-                Some(v) => fields[nf] = v,
-                None => bad = true,
-            }
+    sc.blks.push(Blk { c: 0, q: 0, cc: cc as u32, qc });
+    unsafe {
+        sc.cpos.set_len(cc);
+        sc.npos.set_len(nc);
+    }
+}
+
+#[inline(always)]
+fn line<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], sc: &Scratch, base: usize, ls: usize, le: usize, f: &mut F) {
+    if le == ls {
+        return;
+    }
+    let at = |x: usize| unsafe { sc.blks.get_unchecked((x - base) >> 6) };
+    let low = |x: usize| (1u64 << (x & 63)).wrapping_sub(1);
+    let (a, b) = (at(ls), at(le));
+    let r0 = (a.cc + (a.c & low(ls)).count_ones()) as usize;
+    let r1 = (b.cc + (b.c & low(le)).count_ones()) as usize;
+    if r1 - r0 != N - 1 {
+        return;
+    }
+    let quotes = b.qc + (b.q & low(le)).count_ones() - a.qc - (a.q & low(ls)).count_ones();
+    let mut bounds = [0usize; N];
+    let cpos = unsafe { sc.cpos.get_unchecked(r0..r0 + N - 1) };
+    for k in 0..N - 1 {
+        bounds[k] = cpos[k] as usize;
+    }
+    bounds[N - 1] = le;
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+    let mut s = ls;
+    if quotes == 0 {
+        for k in 0..N {
+            fields[k] = unsafe { buf.get_unchecked(s..bounds[k]) };
+            s = bounds[k] + 1;
+        }
+    } else if le < buf.len() {
+        // every field start is at most le < len, so its first byte exists;
+        // the byte before a field end exists unless the end is 0 (then the
+        // field is empty and the byte is not used)
+        let p = buf.as_ptr();
+        let mut ok = 0usize;
+        for k in 0..N {
+            let e = bounds[k];
+            let (first, lastb) = unsafe { (*p.add(s), *p.add(e.max(1) - 1)) };
+            let q = ((e >= s + 2) & (first == b'"') & (lastb == b'"')) as usize;
+            fields[k] = unsafe { std::slice::from_raw_parts(p.add(s + q), e - s - 2 * q) };
+            ok += q;
+            s = e + 1;
+        }
+        if 2 * ok as u32 != quotes {
+            return;
+        }
+    } else {
+        // the last line of the buffer, without a newline
+        let mut ok = 0u32;
+        let last = buf.len() - 1;
+        for k in 0..N {
+            let e = bounds[k];
+            let first = unsafe { *buf.get_unchecked(s.min(last)) };
+            let lastb = unsafe { *buf.get_unchecked(e.wrapping_sub(1).max(s).min(last)) };
+            let q = ((e - s >= 2) & (first == b'"') & (lastb == b'"')) as usize;
+            fields[k] = unsafe { buf.get_unchecked(s + q..e - q) };
+            ok += 2 * q as u32;
+            s = e + 1;
+        }
+        if ok != quotes {
+            return;
+        }
+    }
+    f(&fields);
+}
+
+/// One line (without its newline), the plain way.
+#[cold]
+fn slow_line<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(l: &'a [u8], f: &mut F) {
+    if l.is_empty() {
+        return;
+    }
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+    let mut nf = 0;
+    for fld in l.split(|&c| c == b',') {
+        if nf == N {
+            return;
+        }
+        match unquote(fld) {
+            Some(v) => fields[nf] = v,
+            None => return,
         }
         nf += 1;
-        if !bad && nf == N {
-            f(&fields);
-        }
+    }
+    if nf == N {
+        f(&fields);
     }
 }
 
@@ -105,7 +257,7 @@ fn unquote(fld: &[u8]) -> Option<&[u8]> {
     }
 }
 
-/// For the 64 bytes at `p`: (separator mask: ',' or '\n', newline mask, quote mask).
+/// For the 64 bytes at `p`: (comma mask, newline mask, quote mask).
 #[inline(always)]
 unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -124,7 +276,7 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
         let n = mm(nla, nlb);
         let c = mm(_mm256_cmpeq_epi8(a, comma), _mm256_cmpeq_epi8(b, comma));
         let q = mm(_mm256_cmpeq_epi8(a, quote), _mm256_cmpeq_epi8(b, quote));
-        return (c | n, n, q);
+        return (c, n, q);
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -143,7 +295,7 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
             vgetq_lane_u64(vreinterpretq_u64_u8(s), 0)
         };
         let n = mask(b'\n');
-        return (mask(b',') | n, n, mask(b'"'));
+        return (mask(b','), n, mask(b'"'));
     }
     #[allow(unreachable_code)]
     {
@@ -154,7 +306,7 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
             n |= ((ch == b'\n') as u64) << i;
             q |= ((ch == b'"') as u64) << i;
         }
-        (c | n, n, q)
+        (c, n, q)
     }
 }
 
@@ -219,9 +371,162 @@ fn civil_ms(b: &[u8]) -> Option<i64> {
 
 /// Epoch milliseconds of a valid F1, F2 or F3 timestamp; `None` for anything
 /// else. An F3 value that does not fit an i64 is returned as `None`, which is
-/// fine because it lies outside every window.
-#[inline]
+/// fine because it lies outside every window. SWAR fast paths for F1, F2 and
+/// 13-digit F3; everything else (and anything they reject) goes to the
+/// plain parser, so they only need to be exact on what they accept.
+#[inline(always)]
 pub fn parse_ts(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    if n == 20 || n == 25 {
+        if let Some(v) = civil_fast(b) {
+            return Some(v);
+        }
+    } else if n == 13 {
+        let a = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let c = u64::from_le_bytes(b[5..13].try_into().unwrap());
+        if digits(a, !0) && digits(c, !0) {
+            return Some((parse8(a) * 100_000 + parse8(c) % 100_000) as i64);
+        }
+    }
+    parse_ts_slow(b)
+}
+
+const ZEROS: u64 = 0x3030_3030_3030_3030;
+
+/// `ingest_ts`, which the rules guarantee is a valid F1: only its shape and
+/// the table range are checked (anything else goes to `parse_ts`).
+#[inline(always)]
+pub fn parse_ingest(b: &[u8]) -> Option<i64> {
+    if b.len() != 20 {
+        return parse_ts(b);
+    }
+    let lo = u64::from_le_bytes(b[0..8].try_into().unwrap()); // YYYY-MM-
+    let mid = u64::from_le_bytes(b[8..16].try_into().unwrap()); // DDTHH:MM
+    let t = u32::from_le_bytes(b[16..20].try_into().unwrap()) as u64; // :SSZ
+    const DM_LO: u64 = 0x00FF_FF00_FFFF_FFFF;
+    const DM_MID: u64 = 0xFFFF_00FF_FF00_FFFF;
+    let l = (lo & DM_LO).wrapping_sub(ZEROS & DM_LO);
+    let lp = l.wrapping_mul(10).wrapping_add(l >> 8);
+    let m = (mid & DM_MID).wrapping_sub(ZEROS & DM_MID);
+    let mp = m.wrapping_mul(10).wrapping_add(m >> 8);
+    let year = (lp & 0xFF) * 100 + ((lp >> 16) & 0xFF);
+    let month = (lp >> 40) & 0xFF;
+    let yi = year.wrapping_sub(1900);
+    let shape = ((lo & !DM_LO) ^ 0x2D00_002D_0000_0000) | ((mid & !DM_MID) ^ 0x0000_3A00_0054_0000) | ((t & 0xFF00_00FF) ^ 0x5A00_003A);
+    if shape != 0 || yi >= 300 || month.wrapping_sub(1) >= 12 || !digits(lo, DM_LO) {
+        return parse_ts(b);
+    }
+    let day = (mp & 0xFF) as i64;
+    let hour = ((mp >> 24) & 0xFF) as i64;
+    let minute = ((mp >> 48) & 0xFF) as i64;
+    let second = (((t >> 8) & 0xFF) * 10 + ((t >> 16) & 0xFF)) as i64 - 528;
+    let days = MONTHS[(yi * 12 + month - 1) as usize] as i64 + day - 1;
+    Some(days * DAY + hour * HOUR + minute * MINUTE + second * SECOND)
+}
+
+/// Are the bytes of `x` selected by `m` (0xFF per byte) all ASCII digits?
+#[inline(always)]
+fn digits(x: u64, m: u64) -> bool {
+    let hi = 0xF0F0_F0F0_F0F0_F0F0u64 & m;
+    (x & hi) == (ZEROS & m) && (x.wrapping_add(0x0606_0606_0606_0606) & hi) == (ZEROS & m)
+}
+
+/// Value of 8 ASCII digits (first byte most significant).
+#[inline(always)]
+fn parse8(x: u64) -> u64 {
+    let mut v = x - ZEROS;
+    v = (v * 10) + (v >> 8);
+    v = (((v & 0x0000_00FF_0000_00FF) * (100 + (1_000_000 << 32)))
+        + (((v >> 16) & 0x0000_00FF_0000_00FF) * (1 + (10_000 << 32))))
+        >> 32;
+    v
+}
+
+/// Day numbers of the first of each month, 1900-01 to 2200-01:
+/// MONTHS[(y - 1900) * 12 + (m - 1)].
+const MONTHS: [i32; 300 * 12 + 1] = {
+    let mut t = [0i32; 300 * 12 + 1];
+    let mut i = 0;
+    while i <= 300 * 12 {
+        let (y, m) = (1900 + (i / 12) as i64, (i % 12) as i64 + 1);
+        let yy = if m <= 2 { y - 1 } else { y };
+        let era = yy.div_euclid(400);
+        let yoe = yy - era * 400;
+        let doy = (153 * ((m + 9) % 12) + 2) / 5;
+        t[i] = (era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468) as i32;
+        i += 1;
+    }
+    t
+};
+
+/// F1 (n == 20) or F2 (n == 25); None when not valid, not that shape, or
+/// outside the years 1900 to 2199 (the plain parser then decides).
+#[inline(always)]
+fn civil_fast(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    let lo = u64::from_le_bytes(b[0..8].try_into().unwrap()); // YYYY-MM-
+    let mid = u64::from_le_bytes(b[8..16].try_into().unwrap()); // DDTHH:MM
+    let t = u32::from_le_bytes(b[16..20].try_into().unwrap()) as u64; // :SS?
+    const DM_LO: u64 = 0x00FF_FF00_FFFF_FFFF;
+    const SEP_LO: u64 = 0x2D00_002D_0000_0000;
+    const DM_MID: u64 = 0xFFFF_00FF_FF00_FFFF;
+    const SEP_MID: u64 = 0x0000_3A00_0054_0000;
+    let seps = ((lo & !DM_LO) ^ SEP_LO) | ((mid & !DM_MID) ^ SEP_MID) | ((t & 0xFF) ^ 0x3A);
+    if seps != 0 || !(digits(lo, DM_LO) & digits(mid, DM_MID) & digits(t, 0x00FF_FF00)) {
+        return None;
+    }
+    // byte i of x*10 + (x >> 8) is 10 * digit i + digit i+1
+    let l = (lo & DM_LO) - (ZEROS & DM_LO);
+    let lp = l * 10 + (l >> 8);
+    let m = (mid & DM_MID) - (ZEROS & DM_MID);
+    let mp = m * 10 + (m >> 8);
+    let year = (lp & 0xFF) * 100 + ((lp >> 16) & 0xFF);
+    let month = (lp >> 40) & 0xFF;
+    let day = mp & 0xFF;
+    let hour = (mp >> 24) & 0xFF;
+    let minute = (mp >> 48) & 0xFF;
+    let second = ((t >> 8) & 0xFF) * 10 + ((t >> 16) & 0xFF) - 528;
+    let yi = year.wrapping_sub(1900);
+    if (yi >= 300) | (month.wrapping_sub(1) >= 12) | (hour > 23) | (minute > 59) | (second > 59) {
+        return None;
+    }
+    let idx = (yi * 12 + month - 1) as usize;
+    let (ms, me) = (MONTHS[idx] as i64, MONTHS[idx + 1] as i64);
+    if (day.wrapping_sub(1) as i64) >= me - ms || day == 0 {
+        return None;
+    }
+    let tag = (t >> 24) as u8;
+    let mut off = 0i64;
+    if n == 20 {
+        if tag != b'Z' {
+            return None;
+        }
+    } else {
+        // +HH:MM / -HH:MM
+        let o = u64::from_le_bytes(b[17..25].try_into().unwrap()); // SS?HH:MM
+        if (tag != b'+' && tag != b'-') || (o >> 40) & 0xFF != 0x3A || !digits(o, 0xFFFF_00FF_FF00_0000) {
+            return None;
+        }
+        let oh = (((o >> 24) & 0xFF) as i64 - 48) * 10 + (((o >> 32) & 0xFF) as i64 - 48);
+        let om = (((o >> 48) & 0xFF) as i64 - 48) * 10 + (((o >> 56) & 0xFF) as i64 - 48);
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        off = (oh * 60 + om) * MINUTE;
+        if tag == b'+' {
+            off = -off;
+        }
+    }
+    let days = ms + day as i64 - 1;
+    Some(days * DAY + hour as i64 * HOUR + minute as i64 * MINUTE + second as i64 * SECOND + off)
+}
+
+/// Epoch milliseconds of a valid F1, F2 or F3 timestamp; `None` for anything
+/// else. An F3 value that does not fit an i64 is returned as `None`, which is
+/// fine because it lies outside every window.
+#[cold]
+#[inline(never)]
+fn parse_ts_slow(b: &[u8]) -> Option<i64> {
     let n = b.len();
     if n == 0 {
         return None;
@@ -311,6 +616,57 @@ mod tests {
         assert!(parse_ts(b"2028-02-29T00:00:00Z").is_some());
         assert_eq!(parse_ts(b"86400000"), Some(86400000));
     }
+    #[test]
+    fn ts_fuzz() {
+        let mut state = 0x1234_5678_9ABC_DEF1u64;
+        let mut rnd = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let seeds: [&[u8]; 8] = [
+            b"2027-12-18T22:22:54Z", b"2027-12-12T12:21:38-06:00", b"2028-02-29T23:59:59+05:30", b"1829168499000",
+            b"0000-01-01T00:00:00Z", b"9999-12-31T23:59:59Z", b"2100-02-28T00:00:00-23:59", b"0001829168499",
+        ];
+        let alpha = b"0123456789:-+TZ /09";
+        for it in 0..2_000_000 {
+            let mut v = seeds[it % seeds.len()].to_vec();
+            let k = (rnd() % 3) as usize;
+            for _ in 0..k {
+                let i = (rnd() as usize) % v.len();
+                v[i] = alpha[(rnd() as usize) % alpha.len()];
+            }
+            assert_eq!(parse_ts(&v), parse_ts_slow(&v), "{:?}", String::from_utf8_lossy(&v));
+        }
+        for i in 0..200_000u64 {
+            let t = (i * 7_919_993_000) % 4_000_000_000_000;
+            let secs = t / 1000;
+            let (d, r) = ((secs / 86400) as i64, secs % 86400);
+            // civil from days (inverse of days_from_civil)
+            let z = d + 719_468;
+            let era = z.div_euclid(146_097);
+            let doe = z - era * 146_097;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let dd = doy - (153 * mp + 2) / 5 + 1;
+            let mm = if mp < 10 { mp + 3 } else { mp - 9 };
+            let yy = yoe + era * 400 + (mm <= 2) as i64;
+            let s = format!("{yy:04}-{mm:02}-{dd:02}T{:02}:{:02}:{:02}Z", r / 3600, r / 60 % 60, r % 60);
+            assert_eq!(parse_ingest(s.as_bytes()), parse_ts_slow(s.as_bytes()), "{s}");
+            assert_eq!(parse_ingest(s.as_bytes()), Some((secs * 1000) as i64), "{s}");
+        }
+        for y in [0i64, 1, 4, 100, 400, 1600, 1900, 1970, 2000, 2024, 2027, 2100, 9999] {
+            for mo in 1..=12 {
+                for d in [1, 28, 29, 30, 31] {
+                    let s = format!("{y:04}-{mo:02}-{d:02}T13:07:59Z");
+                    assert_eq!(parse_ts(s.as_bytes()), parse_ts_slow(s.as_bytes()), "{s}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn lines() {
         let mut out = Vec::new();

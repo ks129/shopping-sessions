@@ -8,6 +8,7 @@ name = "pipeline"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 memchr = "2"
 memmap2 = "0.9"
 hashbrown = "0.15"

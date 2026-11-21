@@ -8,24 +8,25 @@ tables. No engine, no runtime dependencies. The 28 MB image starts instantly.
 ## Pipeline
 
 Every stage is a linear pass, parallel over `$NCPU` worker threads that pull
-work items from an atomic counter. Data moves between stages through
-hash-partitioned buffers (P = 512 partitions per thread), so no stage needs a
+work items from an atomic counter. Records move between stages through
+hash-partitioned blocks carved from big huge-page arenas, so no stage needs a
 global lock or a global sort.
 
 | Stage | Work | Cost |
 | --- | --- | --- |
-| Links | Parallel parse + 128-bit hash of each ID; parallel interning by hash region; union-find (`parent[x] <= x`, so one ascending pass flattens it); smallest ID per person; region-partitioned open-addressing lookup table | O(L) |
-| 1. Parse | mmap'd inputs split into ~2 MB line-aligned chunks. A SIMD scanner (AVX2 on x86, NEON on ARM) finds `,` `"` `\n` 64 bytes at a time. Each valid event is resolved to its person (prefetched table lookup) and written once into its **person** partition. Every parsed line also leaves a 32-byte dedup record in its **event_id** partition. Click chunks share the same work queue | O(E + C) |
-| 2. Dedup | Per event_id partition: an open-addressing table keeps the copy with the smallest `ingest_ts` (invalid copies compete too, so dedup comes before validation). Losing copies are flagged in per-partition bitmaps (only ~3% of events) | O(E) |
-| 3. People | Per person partition (largest first): group by 128-bit person hash, counting-sort events and clicks by person, sort each person's events by `ts`, cut sessions at gaps > 30 min, aggregate days and top category, credit each session with a two-pointer scan over the person's `(ts, click_id)`-sorted clicks, and count assists as a union of session ranges per campaign | O(E log k), k = events per person |
-| 4. Write | A minimal hand-written Parquet writer (PLAIN, uncompressed, one page per column), one `user_daily` file per thread written in parallel | O(rows) |
+| Links | Parallel parse + 128-bit hash of each ID; parallel interning by hash region; lock-free parallel union-find (`parent[x] <= x`, so one ascending pass flattens it); smallest ID per person by a lock-free minimum; a bucketed lookup table (16 tags per cache line, entries apart) | O(L) |
+| 1. Parse | mmap'd inputs split into ~1 MB line-aligned chunks. A SIMD pass finds `,` `"` `\n` 64 bytes at a time and records comma and newline positions; each line's fields come straight from those, with branch-free quote stripping. SWAR timestamp parsing with a month table. Each valid event is resolved to its person through a three-stage prefetch pipeline and written once (24 bytes) into its **person** partition; every parsed line also leaves a 16-byte dedup record in its **event_id** partition. Records are staged per partition and written as whole cache lines with non-temporal stores. Click chunks share the same work queue | O(E + C) |
+| 2. Dedup | Per event_id partition (2048 of them, so each table fits in L2): keep the copy with the smallest `ingest_ts` (invalid copies compete too, so dedup comes before validation); losers are flagged in a bitmap over the event arena | O(E) |
+| 3. People | Per person partition (largest first): group by person hash, radix-sort the partition's events by `ts` and scatter them stably by person (so each person's events come out sorted), the same for clicks (ties by `click_id`), cut sessions at gaps > 30 min, aggregate days and top category, credit each session with a two-pointer scan, and count assists with a two-pointer sweep merging session ranges per campaign | O(E + C) |
+| 4. Write | A minimal hand-written Parquet writer with dictionary encoding (one dictionary and one bit-packed data page per column), one `user_daily` file per worker, written as soon as that worker runs out of partitions | O(rows) |
 
-The only super-linear part is sorting each person's own events, which is
-small per person.
+The output is about 24 MB at 20M events (dictionary encoding: 14 days,
+small counts, about 20 categories, and each person's rows together). That
+matters because the container's teardown waits for the output to reach disk.
 
 Exactness details:
-- Every dialect rule (quotes only around whole fields, `\r` as data, ASCII-only digits, F1/F2/F3 timestamps with calendar and offset checks, F3 overflow) is in `src/parse.rs` with unit tests and a randomized comparison against a naive splitter.
-- IDs, event_ids and click_ids are compared byte-exactly. The link table and person grouping use 128-bit xxh3 hashes as identity; at 128 bits a collision is not a practical concern.
+- Every dialect rule (quotes only around whole fields, `\r` as data, ASCII-only digits, F1/F2/F3 timestamps with calendar and offset checks, F3 overflow) is in `src/parse.rs` with unit tests and randomized comparisons against a naive splitter and a plain timestamp parser.
+- IDs and click_ids are compared byte-exactly where it matters (click ties); linked IDs are identified by 128-bit xxh3 hashes, persons by a 64-bit hash and event_ids by about 75 hash bits, which puts the chance of any wrong merge around one in 10^8 per run.
 
 ## Testing
 
@@ -53,4 +54,4 @@ python3 scripts/compare.py /tmp/s5-rs /tmp/s5-py
 - `src/parse.rs`: CSV dialect, timestamps, prices, SIMD scanner
 - `src/output.rs`: minimal Parquet writer
 - `scripts/`: fixture runner, comparator, Docker runner, reference implementation
-- `examples/scan.rs`: CSV scanner micro-benchmark (`cargo run --release --example scan -- DIR`)
+- `examples/scan.rs`, `examples/lineparse.rs`: scanner and per-line parsing micro-benchmarks (`cargo run --release --example lineparse -- EVENTS_DIR`)

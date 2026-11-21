@@ -1,5 +1,8 @@
-//! A minimal Parquet writer for flat tables: one row group, one PLAIN,
-//! uncompressed data page (v1) per column, Thrift-compact metadata.
+//! A minimal Parquet writer for flat tables: one row group; per column a
+//! PLAIN dictionary page and one RLE_DICTIONARY data page (v1), uncompressed;
+//! Thrift-compact metadata. Dictionary encoding keeps the files small (the
+//! output has few distinct days, counts and categories, and each person's
+//! rows together), which matters when the output must reach the disk.
 //! Supported columns: required UTF8 strings, optional UTF8 strings,
 //! required DATE (INT32) and required INT64.
 
@@ -34,44 +37,134 @@ impl Col<'_> {
     fn optional(&self) -> bool {
         matches!(self, Col::OptStr(_))
     }
-    /// Page body: definition levels (optional columns) then PLAIN values.
-    fn encode(&self, out: &mut Vec<u8>) {
-        match self {
-            Col::Str(v) => {
-                for s in v {
-                    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                    out.extend_from_slice(s);
-                }
-            }
+}
+
+impl Col<'_> {
+    /// (dictionary page body in PLAIN, dictionary size, data page body:
+    /// definition levels for optional columns, then the bit width and the
+    /// indices as one bit-packed run).
+    fn encode_dict(&self) -> (Vec<u8>, usize, Vec<u8>) {
+        let mut dict = Vec::new();
+        let mut idx: Vec<u32> = Vec::new();
+        let mut out = Vec::new();
+        let nd = match self {
+            Col::Str(v) => dict_runs(v, &mut dict, &mut idx),
             Col::OptStr(v) => {
-                // RLE/bit-packed hybrid, bit width 1, all bit-packed groups of 8.
-                let groups = v.len().div_ceil(8);
-                let mut lv = Vec::with_capacity(groups + 8);
-                varint(&mut lv, ((groups as u64) << 1) | 1);
-                for g in v.chunks(8) {
-                    let mut b = 0u8;
-                    for (i, x) in g.iter().enumerate() {
-                        b |= (x.is_some() as u8) << i;
-                    }
-                    lv.push(b);
-                }
-                out.extend_from_slice(&(lv.len() as u32).to_le_bytes());
-                out.extend_from_slice(&lv);
-                for s in v.iter().flatten() {
-                    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                    out.extend_from_slice(s);
-                }
+                def_levels(v, &mut out);
+                dict_bytes(v.iter().flatten().copied(), &mut dict, &mut idx)
             }
-            Col::Date(v) => {
-                for x in v {
-                    out.extend_from_slice(&x.to_le_bytes());
-                }
+            Col::Date(v) => dict_ints(v.iter().map(|&x| x as i64), 4, &mut dict, &mut idx),
+            Col::I64(v) => dict_ints(v.iter().copied(), 8, &mut dict, &mut idx),
+        };
+        let bw = (usize::BITS - nd.saturating_sub(1).leading_zeros()).max(1) as usize;
+        out.push(bw as u8);
+        bitpack(&idx, bw, &mut out);
+        (dict, nd, out)
+    }
+}
+
+fn dict_bytes<'a>(vals: impl Iterator<Item = &'a [u8]>, dict: &mut Vec<u8>, idx: &mut Vec<u32>) -> usize {
+    let mut map: hashbrown::HashMap<&[u8], u32> = hashbrown::HashMap::new();
+    for v in vals {
+        let n = map.len() as u32;
+        let i = *map.entry(v).or_insert_with(|| {
+            dict.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            dict.extend_from_slice(v);
+            n
+        });
+        idx.push(i);
+    }
+    map.len()
+}
+
+/// A dictionary that gets a new entry whenever the value differs from the
+/// previous one (the same slice, or equal bytes). Exact for any input; small
+/// when equal values come in runs (each person's rows are together).
+fn dict_runs(vals: &[&[u8]], dict: &mut Vec<u8>, idx: &mut Vec<u32>) -> usize {
+    let mut n = 0u32;
+    let mut prev: &[u8] = &[];
+    for (k, &v) in vals.iter().enumerate() {
+        let same = k > 0 && ((v.as_ptr() == prev.as_ptr() && v.len() == prev.len()) || v == prev);
+        if !same {
+            dict.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            dict.extend_from_slice(v);
+            n += 1;
+            prev = v;
+        }
+        idx.push(n - 1);
+    }
+    n as usize
+}
+
+fn dict_ints(vals: impl Iterator<Item = i64> + Clone, width: usize, dict: &mut Vec<u8>, idx: &mut Vec<u32>) -> usize {
+    // a direct table when the values span a small range
+    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+    for v in vals.clone() {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    if lo <= hi && (hi as i128 - lo as i128) < 1 << 16 {
+        let mut tab = vec![u32::MAX; (hi - lo + 1) as usize];
+        let mut n = 0u32;
+        for v in vals {
+            let t = &mut tab[(v - lo) as usize];
+            if *t == u32::MAX {
+                *t = n;
+                n += 1;
+                dict.extend_from_slice(&v.to_le_bytes()[..width]);
             }
-            Col::I64(v) => {
-                for x in v {
-                    out.extend_from_slice(&x.to_le_bytes());
-                }
-            }
+            idx.push(*t);
+        }
+        return n as usize;
+    }
+    let mut map: hashbrown::HashMap<i64, u32> = hashbrown::HashMap::new();
+    for v in vals {
+        let n = map.len() as u32;
+        let i = *map.entry(v).or_insert_with(|| {
+            dict.extend_from_slice(&v.to_le_bytes()[..width]);
+            n
+        });
+        idx.push(i);
+    }
+    map.len()
+}
+
+/// Definition levels (bit width 1) as a length-prefixed bit-packed run.
+fn def_levels(v: &[Option<&[u8]>], out: &mut Vec<u8>) {
+    let groups = v.len().div_ceil(8);
+    let mut lv = Vec::with_capacity(groups + 8);
+    varint(&mut lv, ((groups as u64) << 1) | 1);
+    for g in v.chunks(8) {
+        let mut b = 0u8;
+        for (i, x) in g.iter().enumerate() {
+            b |= (x.is_some() as u8) << i;
+        }
+        lv.push(b);
+    }
+    out.extend_from_slice(&(lv.len() as u32).to_le_bytes());
+    out.extend_from_slice(&lv);
+}
+
+/// RLE/bit-packed hybrid: one bit-packed run of all values (LSB first),
+/// padded to a multiple of 8 values.
+fn bitpack(vals: &[u32], bw: usize, out: &mut Vec<u8>) {
+    let groups = vals.len().div_ceil(8);
+    varint(out, ((groups as u64) << 1) | 1);
+    let start = out.len();
+    out.resize(start + groups * bw, 0);
+    let buf = &mut out[start..];
+    let mut bit = 0usize;
+    for &v in vals {
+        let mut v = v as u64;
+        let mut left = bw;
+        while left > 0 {
+            let byte = bit >> 3;
+            let off = bit & 7;
+            let take = (8 - off).min(left);
+            buf[byte] |= ((v & ((1 << take) - 1)) << off) as u8;
+            v >>= take;
+            bit += take;
+            left -= take;
         }
     }
 }
@@ -157,28 +250,38 @@ pub fn write(path: &Path, cols: &[(&str, Col)]) {
     let nrows = cols.first().map_or(0, |c| c.1.len());
     let mut file: Vec<u8> = Vec::new();
     file.extend_from_slice(b"PAR1");
-    let mut chunks = Vec::new(); // (offset, total size)
-    let mut body = Vec::new();
+    let mut chunks = Vec::new(); // (dictionary page offset, data page offset, total size)
     for (_, col) in cols {
         assert_eq!(col.len(), nrows);
-        body.clear();
-        col.encode(&mut body);
-        assert!(body.len() < i32::MAX as usize, "page too large");
+        let (dict, nd, body) = col.encode_dict();
+        assert!(body.len() < i32::MAX as usize && dict.len() < i32::MAX as usize, "page too large");
+        let doff = file.len();
+        let mut h = Thrift::new();
+        h.i32(1, 2); // DICTIONARY_PAGE
+        h.i32(2, dict.len() as i32);
+        h.i32(3, dict.len() as i32);
+        h.begin(Some(7));
+        h.i32(1, nd as i32);
+        h.i32(2, 0); // PLAIN
+        h.end();
+        h.out.push(0);
+        file.extend_from_slice(&h.out);
+        file.extend_from_slice(&dict);
+        let poff = file.len();
         let mut h = Thrift::new();
         h.i32(1, 0); // DATA_PAGE
         h.i32(2, body.len() as i32);
         h.i32(3, body.len() as i32);
         h.begin(Some(5));
         h.i32(1, nrows as i32);
-        h.i32(2, 0); // PLAIN
+        h.i32(2, 8); // RLE_DICTIONARY
         h.i32(3, 3); // RLE
         h.i32(4, 3); // RLE
         h.end();
         h.out.push(0);
-        let off = file.len();
         file.extend_from_slice(&h.out);
         file.extend_from_slice(&body);
-        chunks.push((off, file.len() - off));
+        chunks.push((doff, poff, file.len() - doff));
     }
 
     let mut m = Thrift::new();
@@ -210,23 +313,25 @@ pub fn write(path: &Path, cols: &[(&str, Col)]) {
     m.begin(None);
     m.list(1, T_STRUCT, cols.len());
     let mut total = 0i64;
-    for ((name, col), &(off, size)) in cols.iter().zip(&chunks) {
+    for ((name, col), &(doff, poff, size)) in cols.iter().zip(&chunks) {
         let (ty, _, _) = col.types();
         total += size as i64;
         m.begin(None);
-        m.i64(2, off as i64);
+        m.i64(2, doff as i64);
         m.begin(Some(3));
         m.i32(1, ty);
-        m.list(2, T_I32, 2);
+        m.list(2, T_I32, 3);
         m.zz(0); // PLAIN
         m.zz(3); // RLE
+        m.zz(8); // RLE_DICTIONARY
         m.list(3, T_BINARY, 1);
         m.raw_bin(name.as_bytes());
         m.i32(4, 0); // UNCOMPRESSED
         m.i64(5, nrows as i64);
         m.i64(6, size as i64);
         m.i64(7, size as i64);
-        m.i64(9, off as i64);
+        m.i64(9, poff as i64);
+        m.i64(11, doff as i64);
         m.end();
         m.end();
     }
